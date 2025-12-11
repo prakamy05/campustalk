@@ -44,7 +44,7 @@ export default function VideoPage(){
     await supabase.from('waiting_queue').upsert({ user_id: profile.id, filters: { university_id: profile.university_id } });
     // call match attempt function via Supabase Functions endpoint
     const token = (await supabase.auth.getSession()).data.session?.access_token;
-    const res = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/matchmake`, {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_MATCHMAKE_URL}/functions/v1/matchmake`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'apikey': process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, 'Content-Type':'application/json' },
       body: JSON.stringify({ user_id: profile.id })
