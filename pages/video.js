@@ -16,7 +16,6 @@ export default function VideoPage() {
   const pcRef = useRef(null);
   const sessionRef = useRef(null);
 
-  const queueChannelRef = useRef(null);
   const sessionChannelRef = useRef(null);
   const signalChannelRef = useRef(null);
 
@@ -39,22 +38,22 @@ export default function VideoPage() {
       try {
         const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (localVideoRef.current) localVideoRef.current.srcObject = s;
-      } catch (e) { console.error('getUserMedia', e); }
+      } catch (e) {
+        console.error('getUserMedia', e);
+      }
     })();
 
     return () => {
-      cleanupAllChannels();
+      cleanup();
       if (pcRef.current) pcRef.current.close();
     };
   }, []);
 
-  // ------------------------------
-  // CLEANUP HELPERS
-  // ------------------------------
-  function cleanupAllChannels() {
-    queueChannelRef.current?.unsubscribe();
-    sessionChannelRef.current?.unsubscribe();
-    signalChannelRef.current?.unsubscribe();
+  function cleanup() {
+    if (sessionChannelRef.current)
+      sessionChannelRef.current.unsubscribe();
+    if (signalChannelRef.current)
+      signalChannelRef.current.unsubscribe();
   }
 
   // ------------------------------
@@ -68,13 +67,7 @@ export default function VideoPage() {
 
     const token = (await supabase.auth.getSession()).data.session?.access_token;
 
-    let uni = profile.university_id ?? null;
-    let year = profile.year ?? null;
-
-    // --- FIX 1: Correct matchmake URL (no duplication) ---
-    const url = `${process.env.NEXT_PUBLIC_MATCHMAKE_URL}/functions/v1/matchmake`;
-
-    const res = await fetch(url, {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_MATCHMAKE_URL}/functions/v1/matchmake`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -83,69 +76,59 @@ export default function VideoPage() {
       },
       body: JSON.stringify({
         user_id: profile.id,
-        university_id: uni,
-        year: year
+        university_id: profile.university_id || null,
+        year: profile.year || null
       })
-    }).catch(err => {
-      console.error('Fetch error:', err);
-      return { ok: false };
     });
-
-    if (!res || !res.ok) {
-      console.error("Matchmake API failed:", res?.status);
-      setSearching(false);
-      return;
-    }
 
     const json = await res.json();
 
     if (json.matched) {
-      setMatchInfo(json);
-      sessionRef.current = json.session_id;
-
-      await createPeerAndListen(
-        json.session_id,
-        json.other_user_id,
-        json.offerer === profile.id
-      );
-
+      // immediate match
+      matchAndStart(json.session_id, json.other_user_id, json.offerer === profile.id);
     } else {
-      listenForMatches(profile.id);
+      // wait for new session to be created
+      listenForSession(profile.id);
     }
   }
 
   // ------------------------------
-  // WAIT FOR SERVER MATCH
+  // WAIT FOR MATCH SESSION
   // ------------------------------
-  function listenForMatches(userId) {
-    cleanupAllChannels();
-
-    queueChannelRef.current = supabase.channel('public:waiting_queue')
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'waiting_queue' }, () => {})
-      .subscribe();
+  function listenForSession(myId) {
+    cleanup();
 
     sessionChannelRef.current = supabase.channel('public:sessions')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sessions' }, payload => {
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'sessions'
+      }, payload => {
         const s = payload.new;
-        if (s.user_a === userId || s.user_b === userId) {
-
-          const other = s.user_a === userId ? s.user_b : s.user_a;
-          sessionRef.current = s.id;
-
-          setMatchInfo({ matched: true, session_id: s.id, other_user_id: other });
-
-          cleanupAllChannels();
-          createPeerAndListen(s.id, other, false);
+        if (s.user_a === myId || s.user_b === myId) {
+          const other = s.user_a === myId ? s.user_b : s.user_a;
+          matchAndStart(s.id, other, false);
         }
       })
       .subscribe();
   }
 
   // ------------------------------
-  // CREATE PEER + SIGNALING
+  // FINAL: START WEBRTC SESSION
   // ------------------------------
-  async function createPeerAndListen(sessionId, otherUserId, amOfferer) {
+  async function matchAndStart(sessionId, otherId, amOfferer) {
+    cleanup();
+    setMatchInfo({ session_id: sessionId, other_user_id: otherId });
+    sessionRef.current = sessionId;
 
+    await createPeer(sessionId, otherId, amOfferer);
+    subscribeToSignals(sessionId, otherId);
+  }
+
+  // ------------------------------
+  // CREATE PEER CONNECTION
+  // ------------------------------
+  async function createPeer(sessionId, otherId, amOfferer) {
     if (pcRef.current) pcRef.current.close();
 
     pcRef.current = new RTCPeerConnection(STUN);
@@ -154,65 +137,24 @@ export default function VideoPage() {
     if (localStream)
       localStream.getTracks().forEach(t => pcRef.current.addTrack(t, localStream));
 
-    pcRef.current.ontrack = ev => {
+    pcRef.current.ontrack = e => {
       if (remoteVideoRef.current)
-        remoteVideoRef.current.srcObject = ev.streams[0];
+        remoteVideoRef.current.srcObject = e.streams[0];
     };
 
-    pcRef.current.onicecandidate = async (e) => {
+    pcRef.current.onicecandidate = async e => {
       if (!e.candidate) return;
+      if (!sessionRef.current) return;
 
       await supabase.from('signals').insert([{
         session_id: sessionId,
         from_user: profile.id,
-        to_user: otherUserId,
-        payload: { type: 'ice', candidate: e.candidate }
+        to_user: otherId,
+        payload: { type: "ice", candidate: e.candidate }
       }]);
     };
 
-    if (signalChannelRef.current)
-      signalChannelRef.current.unsubscribe();
-
-    signalChannelRef.current = supabase.channel('signals:' + sessionId)
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'signals',
-        filter: `session_id=eq.${sessionId}`
-      }, async payload => {
-
-        const sig = payload.new;
-        if (sig.from_user === profile.id) return;
-
-        const p = sig.payload;
-
-        if (p.type === 'sdp') {
-          const desc = new RTCSessionDescription(p.sdp);
-
-          if (!pcRef.current.currentRemoteDescription) {
-            await pcRef.current.setRemoteDescription(desc);
-          }
-
-          if (desc.type === 'offer') {
-            const answer = await pcRef.current.createAnswer();
-            await pcRef.current.setLocalDescription(answer);
-
-            await supabase.from('signals').insert([{
-              session_id: sessionId,
-              from_user: profile.id,
-              to_user: sig.from_user,
-              payload: { type: 'sdp', sdp: pcRef.current.localDescription }
-            }]);
-          }
-        }
-
-        if (p.type === 'ice') {
-          try { await pcRef.current.addIceCandidate(p.candidate); }
-          catch (err) { console.error("ICE error:", err); }
-        }
-      })
-      .subscribe();
-
+    // If offerer → start
     if (amOfferer) {
       const offer = await pcRef.current.createOffer();
       await pcRef.current.setLocalDescription(offer);
@@ -220,14 +162,59 @@ export default function VideoPage() {
       await supabase.from('signals').insert([{
         session_id: sessionId,
         from_user: profile.id,
-        to_user: otherUserId,
-        payload: { type: 'sdp', sdp: pcRef.current.localDescription }
+        to_user: otherId,
+        payload: { type: "sdp", sdp: offer }
       }]);
     }
   }
 
   // ------------------------------
-  // UI (unchanged)
+  // SIGNALING CHANNEL
+  // ------------------------------
+  function subscribeToSignals(sessionId, otherId) {
+    signalChannelRef.current = supabase.channel('signals:' + sessionId)
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'signals',
+        filter: `session_id=eq.${sessionId}`
+      }, async payload => {
+        const s = payload.new;
+
+        if (s.from_user === profile.id) return;
+
+        const msg = s.payload;
+
+        if (msg.type === "sdp") {
+          const desc = new RTCSessionDescription(msg.sdp);
+          await pcRef.current.setRemoteDescription(desc);
+
+          if (desc.type === "offer") {
+            const answer = await pcRef.current.createAnswer();
+            await pcRef.current.setLocalDescription(answer);
+
+            await supabase.from('signals').insert([{
+              session_id: sessionId,
+              from_user: profile.id,
+              to_user: otherId,
+              payload: { type: "sdp", sdp: answer }
+            }]);
+          }
+        }
+
+        if (msg.type === "ice") {
+          try {
+            await pcRef.current.addIceCandidate(msg.candidate);
+          } catch (err) {
+            console.error("ICE ERR:", err);
+          }
+        }
+      })
+      .subscribe();
+  }
+
+  // ------------------------------
+  // UI
   // ------------------------------
   return (
     <div style={{ minHeight: '100vh', padding: 20, background: '#0b0f17', color: '#e6eef8' }}>
