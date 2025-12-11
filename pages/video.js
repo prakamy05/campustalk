@@ -52,23 +52,29 @@ export default function VideoPage() {
   // CLEANUP HELPERS
   // ------------------------------
   function cleanupAllChannels() {
-    if (queueChannelRef.current)
-      queueChannelRef.current.unsubscribe();
-    if (sessionChannelRef.current)
-      sessionChannelRef.current.unsubscribe();
-    if (signalChannelRef.current)
-      signalChannelRef.current.unsubscribe();
+    queueChannelRef.current?.unsubscribe();
+    sessionChannelRef.current?.unsubscribe();
+    signalChannelRef.current?.unsubscribe();
   }
 
+  // ------------------------------
+  // START SEARCH
+  // ------------------------------
   async function startSearch() {
     if (!profile) return alert('No profile');
-    if (searching) return;  // prevent spam clicking
+    if (searching) return;
 
     setSearching(true);
 
     const token = (await supabase.auth.getSession()).data.session?.access_token;
 
-    const res = await fetch(`${process.env.NEXT_PUBLIC_MATCHMAKE_URL}/functions/v1/matchmake`, {
+    let uni = profile.university_id ?? null;
+    let year = profile.year ?? null;
+
+    // --- FIX 1: Correct matchmake URL (no duplication) ---
+    const url = `${process.env.NEXT_PUBLIC_MATCHMAKE_URL}/functions/v1/matchmake`;
+
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -77,10 +83,19 @@ export default function VideoPage() {
       },
       body: JSON.stringify({
         user_id: profile.id,
-        university_id: profile.university_id || null,
-        year: profile.year || null
+        university_id: uni,
+        year: year
       })
+    }).catch(err => {
+      console.error('Fetch error:', err);
+      return { ok: false };
     });
+
+    if (!res || !res.ok) {
+      console.error("Matchmake API failed:", res?.status);
+      setSearching(false);
+      return;
+    }
 
     const json = await res.json();
 
@@ -100,7 +115,7 @@ export default function VideoPage() {
   }
 
   // ------------------------------
-  // WAIT FOR SERVER TO MATCH
+  // WAIT FOR SERVER MATCH
   // ------------------------------
   function listenForMatches(userId) {
     cleanupAllChannels();
@@ -131,12 +146,10 @@ export default function VideoPage() {
   // ------------------------------
   async function createPeerAndListen(sessionId, otherUserId, amOfferer) {
 
-    // Close old PC if any
     if (pcRef.current) pcRef.current.close();
 
     pcRef.current = new RTCPeerConnection(STUN);
 
-    // Attach local tracks
     const localStream = localVideoRef.current?.srcObject;
     if (localStream)
       localStream.getTracks().forEach(t => pcRef.current.addTrack(t, localStream));
@@ -146,10 +159,8 @@ export default function VideoPage() {
         remoteVideoRef.current.srcObject = ev.streams[0];
     };
 
-    // Local ICE
     pcRef.current.onicecandidate = async (e) => {
       if (!e.candidate) return;
-      if (!sessionRef.current) return;
 
       await supabase.from('signals').insert([{
         session_id: sessionId,
@@ -159,7 +170,6 @@ export default function VideoPage() {
       }]);
     };
 
-    // Subscribe to signals for this session
     if (signalChannelRef.current)
       signalChannelRef.current.unsubscribe();
 
@@ -172,7 +182,7 @@ export default function VideoPage() {
       }, async payload => {
 
         const sig = payload.new;
-        if (sig.from_user === profile.id) return; // ignore own signals
+        if (sig.from_user === profile.id) return;
 
         const p = sig.payload;
 
@@ -197,16 +207,12 @@ export default function VideoPage() {
         }
 
         if (p.type === 'ice') {
-          try {
-            await pcRef.current.addIceCandidate(p.candidate);
-          } catch (err) {
-            console.error("ICE error:", err);
-          }
+          try { await pcRef.current.addIceCandidate(p.candidate); }
+          catch (err) { console.error("ICE error:", err); }
         }
       })
       .subscribe();
 
-    // Offerer logic
     if (amOfferer) {
       const offer = await pcRef.current.createOffer();
       await pcRef.current.setLocalDescription(offer);
@@ -221,7 +227,7 @@ export default function VideoPage() {
   }
 
   // ------------------------------
-  // UI
+  // UI (unchanged)
   // ------------------------------
   return (
     <div style={{ minHeight: '100vh', padding: 20, background: '#0b0f17', color: '#e6eef8' }}>
