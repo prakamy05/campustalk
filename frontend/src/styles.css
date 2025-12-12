@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body { @apply bg-gray-900 text-white; }
+input, button { @apply bg-gray-800 border border-gray-700 text-white rounded; }
+video { border-radius: 8px; background: #000; }
